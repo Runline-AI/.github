@@ -1,0 +1,118 @@
+name: Deploy LXC service (reusable)
+
+# Reusable CD for a Runline service running on a pve-sea-01 LXC, deployed over the
+# tailnet. Generalizes codex-service / current-service's inline deploy.yml into one
+# org-wide primitive so every service (workspaces, work APIs, workstreams, ...) gets
+# the same deploy loop: tailnet join -> rsync -> install -> restart -> health.
+#
+# Runtime env is NOT shipped here: `.env` is excluded from rsync and lives on the box
+# (rendered from OpenBao at bring-up by infrastructure/scripts/deploy-service-lxc.sh).
+# This workflow only ships code + restarts.
+#
+# Call it from a service repo:
+#
+#   # .github/workflows/deploy.yml in the service repo
+#   name: Deploy
+#   on:
+#     push: { branches: [main], paths-ignore: ['docs/**', '**/*.md'] }
+#     workflow_dispatch:
+#   jobs:
+#     deploy:
+#       uses: Runline-AI/.github/.github/workflows/deploy-lxc-service.yml@main
+#       with:
+#         service: current
+#         deploy_host: ${{ vars.DEPLOY_HOST }}   # the LXC IP, e.g. 10.1.0.126
+#         runtime: bun                            # bun | node
+#       secrets: inherit
+#
+# Prereqs on the box (done once by deploy-service-lxc.sh): user `deploy` with sudo
+# for `chown /opt/<service>` + `systemctl restart <service>`, the systemd unit, and
+# `/usr/local/bin/bun` (bun) or Node 22 (node).
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name: systemd unit + /opt/<service> dir"
+        required: true
+        type: string
+      deploy_host:
+        description: "LXC IP reachable over the tailnet (deploy@<host>)"
+        required: true
+        type: string
+      runtime:
+        description: "bun | node"
+        required: false
+        type: string
+        default: bun
+      health_port:
+        required: false
+        type: number
+        default: 3000
+      health_path:
+        required: false
+        type: string
+        default: /health
+    secrets:
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_OAUTH_SECRET:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Connect to tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-deploy
+
+      - name: Set up deploy key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Ensure deploy owns target directory
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            deploy@${{ inputs.deploy_host }} \
+            'sudo /usr/bin/chown -R deploy:deploy /opt/${{ inputs.service }}'
+
+      - name: Sync files to LXC
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='.env' \
+            --exclude='data' \
+            ./ deploy@${{ inputs.deploy_host }}:/opt/${{ inputs.service }}/
+
+      - name: Install and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            deploy@${{ inputs.deploy_host }} '
+              set -e
+              cd /opt/${{ inputs.service }}
+              sudo /usr/bin/chown -R deploy:deploy /opt/${{ inputs.service }}
+              ${{ inputs.runtime == 'bun' && '/usr/local/bin/bun install --frozen-lockfile' || 'npm install --no-audit --no-fund && npm run build' }}
+              sudo /usr/bin/systemctl restart ${{ inputs.service }}
+            '
+
+      - name: Verify health
+        run: |
+          sleep 4
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            deploy@${{ inputs.deploy_host }} \
+            'code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${{ inputs.health_port }}${{ inputs.health_path }}); echo "health: $code"; [ "$code" = "200" ]'
